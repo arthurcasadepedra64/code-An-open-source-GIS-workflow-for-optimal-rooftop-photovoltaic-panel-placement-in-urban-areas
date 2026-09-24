@@ -20,6 +20,7 @@ What it does:
 - Classifies panels into three efficiency buckets
 - Prints power and payback per bucket
 ##################################################
+
 There's also a cleanup step that removes intermediate layers at the end so the project doesn't get cluttered.
 
 ######### Requirements #########
