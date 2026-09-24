@@ -1,0 +1,980 @@
+from qgis.core import (
+    QgsProject, QgsVectorLayer, QgsField, QgsFeature, QgsRaster, QgsPointXY,
+    QgsGeometry, QgsFillSymbol, QgsRasterBandStats
+)
+from qgis.PyQt.QtCore import QVariant
+from qgis import processing
+import math
+import re
+
+  ########################
+# GLOBAL CONFIGURATIONS
+  ########################
+LAYER_ADDRESSES    = "Adresses"
+LAYER_BUILDINGS    = "Edifications"
+LAYER_MDS          = "MDS"
+Z_FIELD            = "Z"
+IDW_POWER          = 1
+PIXEL_SIZE         = 0.1
+MARGIN             = 5
+REPRESENTATIVE_DAYS = [15, 46, 74, 105, 135, 166, 196, 227, 258, 288, 319, 349]
+STEP               = 0.5
+LINKE              = 3.0
+ALBEDO             = 0.2
+PANEL_WIDTH        = 1.0
+PANEL_HEIGHT       = 1.6
+PANEL_AREA         = PANEL_WIDTH * PANEL_HEIGHT
+EFFICIENCY         = 0.16
+PANEL_COST         = 1800.0
+TARIFF             = 0.849
+KC                 = 0.75   # clear-sky index 0-1 (1 corresponds to a fully clear sky)
+
+# Attribute field names in the address layer (adjust if your schema differs)
+FIELD_STREET_TYPE  = 'TIPO_LOGRADOURO'
+FIELD_STREET_NAME  = 'NOME_LOGRADOURO'
+FIELD_PROPERTY_NO  = 'NUMERO_IMOVEL'
+
+  ########################
+# AUXILIARY FUNCTIONS
+  ########################
+def get_layer_by_name(name):
+    # Fetch a project layer by its exact name; raises if not found
+    layers = QgsProject.instance().mapLayersByName(name)
+    if not layers:
+        raise Exception(f"Layer '{name}' not found in the project.")
+    return layers[0]
+
+def get_raster_value_at_point(raster_layer, point):
+    # Sample the raster value at a single XY point; returns None if invalid
+    ident = raster_layer.dataProvider().identify(point, QgsRaster.IdentifyFormatValue)
+    if ident.isValid():
+        return ident.results().get(1)
+    return None
+
+def orientation_radians(degrees):
+    # Convert an angle in degrees to radians
+    return math.radians(degrees)
+
+def create_panel_polygon(center_point, orientation_rad, width, height):
+    # Build a rotated rectangle (a solar panel) around a given center point
+    cos_t = math.cos(orientation_rad)
+    sin_t = math.sin(orientation_rad)
+    hw = width / 2
+    hh = height / 2
+    vertices = [
+        (-hw * cos_t - (-hh) * sin_t + center_point.x(),
+         -hw * sin_t + (-hh) * cos_t + center_point.y()),
+        ( hw * cos_t - (-hh) * sin_t + center_point.x(),
+          hw * sin_t + (-hh) * cos_t + center_point.y()),
+        ( hw * cos_t -  hh * sin_t + center_point.x(),
+          hw * sin_t +  hh * cos_t + center_point.y()),
+        (-hw * cos_t -  hh * sin_t + center_point.x(),
+         -hw * sin_t +  hh * cos_t + center_point.y())
+    ]
+    return QgsGeometry.fromPolygonXY([[QgsPointXY(x, y) for x, y in vertices]])
+
+def panel_does_not_overlap(panel_geometry, existing_panels, tolerance=0.01):
+    # Return True if a candidate panel does not overlap any already-selected panel
+    for p in existing_panels:
+        if panel_geometry.intersects(p['geometry']):
+            int_area = panel_geometry.intersection(p['geometry']).area()
+            if int_area > tolerance:
+                return False
+    return True
+
+def sanitize_suffix(text):
+    # Replace any non-alphanumeric character with '_' so the text can be used in layer names
+    return re.sub(r'[^a-zA-Z0-9]', '_', str(text))
+
+def extract_vertices_from_geom(geom):
+    # Extract the outer-ring vertices of a Polygon or MultiPolygon
+    # (avoids isPolygon() which does not exist in QgsGeometry)
+    vertices = []
+    if geom is None or geom.isEmpty():
+        return vertices
+    if geom.isMultipart():
+        parts = geom.asMultiPolygon()
+        if parts:
+            for part in parts:
+                if part and part[0]:
+                    vertices.extend([(p.x(), p.y()) for p in part[0]])
+    else:
+        poly = geom.asPolygon()
+        if poly and poly[0]:
+            vertices.extend([(p.x(), p.y()) for p in poly[0]])
+    return vertices
+
+# ----------------------- QVariant / None helpers -----------------------
+def to_python_scalar(v):
+    # Unwrap a QVariant into a native Python scalar (or return None)
+    if v is None:
+        return None
+    if hasattr(v, "value"):
+        try:
+            v = v.value()
+        except Exception:
+            pass
+    return v
+
+def is_null_number(v):
+    # Return True if the value is None, empty, or a blank string
+    v = to_python_scalar(v)
+    if v is None:
+        return True
+    if isinstance(v, str) and v.strip() == "":
+        return True
+    return False
+
+def safe_num_str(number):
+    # Build a filesystem/layer-name-safe string from a number (handles None, int, float)
+    v = to_python_scalar(number)
+    if is_null_number(v):
+        return "no_n"
+    try:
+        f = float(v)
+        if f.is_integer():
+            return str(int(f))
+        return str(f).replace(".", "_")
+    except (TypeError, ValueError):
+        return sanitize_suffix(str(v))
+
+def num_matches(value, target):
+    # Compare two property numbers robustly (int, float, str, QVariant, None)
+    v = to_python_scalar(value)
+    t = to_python_scalar(target)
+    v_null = is_null_number(v)
+    t_null = is_null_number(t)
+    if v_null and t_null:
+        return True
+    if v_null or t_null:
+        return False
+    try:
+        return float(v) == float(t)
+    except (TypeError, ValueError):
+        return str(v).strip() == str(t).strip()
+
+def address_key(street_type, street_name, number):
+    # Build a canonical (type, name, number) tuple used for deduplication
+    t = str(street_type).strip().upper() if street_type is not None else ""
+    n = str(street_name).strip().upper() if street_name is not None else ""
+    v = to_python_scalar(number)
+    if is_null_number(v):
+        num_key = None
+    else:
+        try:
+            f = float(v)
+            num_key = int(f) if f.is_integer() else f
+        except (TypeError, ValueError):
+            num_key = str(v).strip().upper()
+    return (t, n, num_key)
+
+def deduplicate_addresses(lst):
+    # Remove duplicate addresses from a list of (type, name, number) tuples
+    seen = set()
+    unique = []
+    for item in lst:
+        k = address_key(item[0], item[1], item[2])
+        if k in seen:
+            continue
+        seen.add(k)
+        unique.append(item)
+    return unique, len(lst) - len(unique)
+
+  ########################
+# STEP 1: IDENTIFY PROPERTY AND CREATE THE Building_Structure LAYER
+# Inputs : address layer (polygon), buildings layer (polygon),
+#          street type, street name, property number
+# Outputs: an in-memory polygon layer named Building_Structure<suffix>
+  ########################
+def find_property_and_buildings(street_type, street_name, property_number,
+                                address_layer, buildings_layer, suffix=""):
+    # Select all addresses matching the given street type / name / number
+    selected_features = [
+        feat for feat in address_layer.getFeatures()
+        if (feat[FIELD_STREET_TYPE] == street_type and
+            feat[FIELD_STREET_NAME] == street_name and
+            num_matches(feat[FIELD_PROPERTY_NO], property_number))
+    ]
+    print(f"Properties found: {len(selected_features)}")
+    if not selected_features:
+        raise Exception("No property matches the criteria.")
+
+    # Keep only buildings whose footprint overlaps >50% with any matched property
+    selected_buildings = []
+    for building in buildings_layer.getFeatures():
+        building_geom = building.geometry()
+        for prop in selected_features:
+            prop_geom = prop.geometry()
+            if prop_geom.intersects(building_geom):
+                intersection = prop_geom.intersection(building_geom)
+                intersection_area = intersection.area()
+                building_area = building_geom.area()
+                if building_area > 0 and (intersection_area / building_area) > 0.5:
+                    selected_buildings.append(building)
+                    break
+
+    print(f"Buildings within the property: {len(selected_buildings)}")
+    if not selected_buildings:
+        raise Exception("No building meets the area criterion.")
+
+    # Build the in-memory polygon layer with the selected buildings
+    crs = buildings_layer.crs()
+    layer_name = f"Building_Structure{suffix}"
+    roof_layer = QgsVectorLayer(f"Polygon?crs={crs.authid()}", layer_name, "memory")
+    prov_roof = roof_layer.dataProvider()
+    prov_roof.addAttributes(buildings_layer.fields())
+    roof_layer.updateFields()
+
+    for feat in selected_buildings:
+        new_feat = QgsFeature(roof_layer.fields())
+        new_feat.setGeometry(feat.geometry())
+        new_feat.setAttributes(feat.attributes())
+        prov_roof.addFeature(new_feat)
+
+    roof_layer.updateExtents()
+    QgsProject.instance().addMapLayer(roof_layer)
+    print(f"Layer '{layer_name}' created.")
+    return roof_layer
+
+  ########################
+# STEP 2: EXTRACT MDS POINTS INSIDE THE BUILDING POLYGONS
+# Inputs : MDS point layer, Building_Structure polygon layer
+# Outputs: an in-memory point layer named MDS_Structure<suffix>
+  ########################
+def extract_mds_points(points_layer, roof_layer, suffix=""):
+    # Clip the MDS point layer to only the points that fall inside the roof polygons
+    intersecting_points = processing.run("native:extractbylocation", {
+        'INPUT': points_layer,
+        'PREDICATE': [0],
+        'INTERSECT': roof_layer,
+        'OUTPUT': 'memory:'
+    })['OUTPUT']
+    layer_name = f"MDS_Structure{suffix}"
+    intersecting_points.setName(layer_name)
+    QgsProject.instance().addMapLayer(intersecting_points)
+    print(f"Layer '{layer_name}' created with {intersecting_points.featureCount()} points.")
+    if intersecting_points.featureCount() == 0:
+        raise Exception("No MDS points inside the roof structure.")
+    return intersecting_points
+
+  ########################
+# STEP 3: IDW INTERPOLATION, SLOPE, ASPECT AND WEIGHTED COMBINATION
+# Inputs : MDS_Structure point layer, Building_Structure polygon layer
+# Outputs: raster layers
+#          - Interpol_IDW_Clipped<suffix>    (DTM interpolated + clipped)
+#          - Slope_InterpolatedIDW<suffix>   (slope in degrees)
+#          - Aspect_InterpolatedIDW<suffix>  (aspect in degrees)
+#          - Weighted_Result<suffix>         (aspect × slope suitability)
+  ########################
+def interpolate_and_combine(points_layer, roof_layer, z_field, idw_power,
+                            pixel_size, margin, suffix=""):
+    # Verify that the Z field exists in the point layer
+    idx_z = points_layer.fields().indexFromName(z_field)
+    if idx_z == -1:
+        raise Exception(f"Field '{z_field}' not found in the MDS layer.")
+
+    # Build the interpolation extent (with a margin around the points)
+    extent = points_layer.extent()
+    xmin = extent.xMinimum() - margin
+    xmax = extent.xMaximum() + margin
+    ymin = extent.yMinimum() - margin
+    ymax = extent.yMaximum() + margin
+    extent_str = f"{xmin},{xmax},{ymin},{ymax} [{points_layer.crs().authid()}]"
+
+    # IDW interpolation using the Z attribute
+    interp_data = f"{points_layer.id()}::~::0::~::{idx_z}::~::0"
+    result_idw = processing.run("qgis:idwinterpolation", {
+        'INTERPOLATION_DATA': interp_data,
+        'DISTANCE_COEFFICIENT': idw_power,
+        'EXTENT': extent_str,
+        'PIXEL_SIZE': pixel_size,
+        'OUTPUT': 'TEMPORARY_OUTPUT'
+    })
+    intermediate_raster = result_idw['OUTPUT']
+
+    # Clip the interpolated raster to the roof polygon
+    clip_result = processing.run("gdal:cliprasterbymasklayer", {
+        'INPUT': intermediate_raster,
+        'MASK': roof_layer,
+        'NODATA': -9999,
+        'ALPHA_BAND': False,
+        'CROP_TO_CUTLINE': True,
+        'KEEP_RESOLUTION': True,
+        'OUTPUT': 'TEMPORARY_OUTPUT'
+    })
+    final_raster = clip_result['OUTPUT']
+
+    raster_idw = QgsRasterLayer(final_raster, f"Interpol_IDW_Clipped{suffix}")
+    if not raster_idw.isValid():
+        raise Exception("Failed to generate the interpolated raster.")
+    QgsProject.instance().addMapLayer(raster_idw)
+    print(f"Raster '{raster_idw.name()}' added.")
+
+    # Slope (degrees) from the DTM
+    slope_result = processing.run("gdal:slope", {
+        'INPUT': final_raster,
+        'BAND': 1,
+        'SCALE': 1.0,
+        'AS_PERCENT': False,
+        'OUTPUT': 'TEMPORARY_OUTPUT'
+    })
+    slope_raster = slope_result['OUTPUT']
+    slope_layer = QgsRasterLayer(slope_raster, f"Slope_InterpolatedIDW{suffix}")
+    if not slope_layer.isValid():
+        raise Exception("Failed to compute slope.")
+    QgsProject.instance().addMapLayer(slope_layer)
+    print(f"Layer '{slope_layer.name()}' added.")
+
+    # Aspect (degrees) from the DTM
+    aspect_result = processing.run("gdal:aspect", {
+        'INPUT': final_raster,
+        'BAND': 1,
+        'TRIG_ANGLE': False,
+        'ZERO_FLAT': False,
+        'OUTPUT': 'TEMPORARY_OUTPUT'
+    })
+    aspect_raster = aspect_result['OUTPUT']
+    aspect_layer = QgsRasterLayer(aspect_raster, f"Aspect_InterpolatedIDW{suffix}")
+    if not aspect_layer.isValid():
+        raise Exception("Failed to compute aspect.")
+    QgsProject.instance().addMapLayer(aspect_layer)
+    print(f"Layer '{aspect_layer.name()}' added.")
+
+    # Weighted suitability = aspect_factor × slope_factor
+    asp_band = f'"{aspect_layer.name()}@1"'
+    decl_band = f'"{slope_layer.name()}@1"'
+    expr_aspect = (
+        f'( ( ({asp_band} >= 315 OR {asp_band} <= 45) * 1 ) + '
+        f'  ( ({asp_band} > 45 AND {asp_band} <= 135) * 0.85 ) + '
+        f'  ( ({asp_band} > 135 AND {asp_band} <= 225) * 0.5 ) + '
+        f'  ( ({asp_band} > 225 AND {asp_band} < 315) * 0.85 ) )'
+    )
+    expr_slope = f'( ({decl_band} >= 5 AND {decl_band} <= 60) )'
+    expression = f'{expr_aspect} * {expr_slope}'
+    cellsize = aspect_layer.rasterUnitsPerPixelX()
+
+    result_comb = processing.run("qgis:rastercalculator", {
+        'EXPRESSION': expression,
+        'LAYERS': [aspect_layer, slope_layer],
+        'EXTENT': aspect_layer.extent(),
+        'CRS': aspect_layer.crs(),
+        'CELLSIZE': cellsize,
+        'REFERENCE_LAYER': aspect_layer,
+        'OUTPUT': 'TEMPORARY_OUTPUT'
+    })
+    weighted_layer = QgsRasterLayer(result_comb['OUTPUT'], f"Weighted_Result{suffix}")
+    if not weighted_layer.isValid():
+        raise Exception("Failed to generate the combined layer.")
+    QgsProject.instance().addMapLayer(weighted_layer)
+    print(f"Layer '{weighted_layer.name()}' added.")
+
+    return {
+        'dem': raster_idw,
+        'slope': slope_layer,
+        'aspect': aspect_layer,
+        'weighted': weighted_layer,
+        'final_raster': final_raster
+    }
+
+  ########################
+# STEP 4: SOLAR RADIATION AND EFFICIENCY DENSITY
+# Inputs : DEM raster, aspect raster, slope raster, weighted raster
+# Outputs: raster layers
+#          - GlobalRad_day_<ddd><suffix>       (one per representative day)
+#          - GlobalRad_Annual_Mean<suffix>     (mean of the 12 days)
+#          - Efficiency_Density<suffix>        (mean × weighted × KC)
+  ########################
+def calculate_solar_radiation(dem, aspect, slope, weighted, representative_days,
+                              step, linke, albedo, suffix=""):
+    # Run r.sun for each representative day and store the resulting rasters
+    daily_layers = []
+    print("Processing representative days...")
+    for day in representative_days:
+        print(f"  Day {day}...")
+        params_rad = {
+            'elevation': dem,
+            'aspect': aspect,
+            'slope': slope,
+            'day': day,
+            'step': step,
+            'linke_value': linke,
+            'albedo_value': albedo,
+            'glob_rad': 'TEMPORARY_OUTPUT'
+        }
+        try:
+            res_rad = processing.run("grass7:r.sun.insoltime", params_rad)
+            raster_day = QgsRasterLayer(res_rad['glob_rad'], f"GlobalRad_day_{day:03d}{suffix}")
+            if raster_day.isValid():
+                QgsProject.instance().addMapLayer(raster_day)
+                daily_layers.append(raster_day)
+            else:
+                print(f"    Failed on day {day}")
+        except Exception as e:
+            print(f"    Error: {e}")
+
+    if not daily_layers:
+        raise Exception("No daily layers were generated.")
+    print(f"Total daily layers: {len(daily_layers)}")
+
+    # Average the 12 daily rasters into a single annual mean raster
+    print("Computing annual mean...")
+    sum_expr = " + ".join([f'"{layer.name()}@1"' for layer in daily_layers])
+    mean_expr = f"({sum_expr}) / {len(daily_layers)}"
+    ref = daily_layers[0]
+
+    params_mean = {
+        'EXPRESSION': mean_expr,
+        'LAYERS': daily_layers,
+        'EXTENT': ref.extent(),
+        'CELLSIZE': ref.rasterUnitsPerPixelX(),
+        'CRS': ref.crs(),
+        'OUTPUT': 'TEMPORARY_OUTPUT'
+    }
+    res_mean = processing.run("qgis:rastercalculator", params_mean)
+    mean_layer = QgsRasterLayer(res_mean['OUTPUT'], f"GlobalRad_Annual_Mean{suffix}")
+    if not mean_layer.isValid():
+        raise Exception("Failed to compute the annual mean.")
+    QgsProject.instance().addMapLayer(mean_layer)
+    print(f"Layer '{mean_layer.name()}' added.")
+
+    # Apply the clear-sky index (KC) in the final density (single multiplication)
+    expr_dens = (f'"{mean_layer.name()}@1" * "{weighted.name()}@1" * {KC}')
+    print(f"Applying clear-sky index KC = {KC} in the density calculation.")
+    params_dens = {
+        'EXPRESSION': expr_dens,
+        'LAYERS': [mean_layer, weighted],
+        'EXTENT': mean_layer.extent(),
+        'CELLSIZE': mean_layer.rasterUnitsPerPixelX(),
+        'CRS': mean_layer.crs(),
+        'OUTPUT': 'TEMPORARY_OUTPUT'
+    }
+    res_dens = processing.run("qgis:rastercalculator", params_dens)
+    density_layer = QgsRasterLayer(res_dens['OUTPUT'], f"Efficiency_Density{suffix}")
+    if not density_layer.isValid():
+        raise Exception("Failed to create Efficiency_Density.")
+    QgsProject.instance().addMapLayer(density_layer)
+    print(f"Layer '{density_layer.name()}' created.")
+    return mean_layer, density_layer
+
+  ########################
+# STEP 5: MEAN ROOF ORIENTATION
+# Inputs : aspect raster, Building_Structure polygon layer
+# Outputs: float — mean roof orientation in degrees (0-360)
+  ########################
+def calculate_mean_orientation(aspect_raster, roof_layer):
+    # Walk every aspect-raster pixel inside the roof and average their directions
+    provider = aspect_raster.dataProvider()
+    extent = aspect_raster.extent()
+    res = aspect_raster.rasterUnitsPerPixelX()
+    roof_geoms = [feat.geometry() for feat in roof_layer.getFeatures()]
+
+    sum_sin = 0.0
+    sum_cos = 0.0
+    count = 0
+
+    x_min = extent.xMinimum()
+    y_max = extent.yMaximum()
+    cols = int(extent.width() / res) + 1
+    rows = int(extent.height() / res) + 1
+
+    for col in range(cols):
+        x = x_min + col * res
+        for row in range(rows):
+            y = y_max - row * res
+            point = QgsPointXY(x, y)
+            if not any(geom.contains(point) for geom in roof_geoms):
+                continue
+            ident = provider.identify(point, QgsRaster.IdentifyFormatValue)
+            if ident.isValid():
+                value = ident.results().get(1)
+                if value is not None and not math.isnan(value):
+                    rad = math.radians(value)
+                    sum_sin += math.sin(rad)
+                    sum_cos += math.cos(rad)
+                    count += 1
+
+    if count == 0:
+        print("Warning: no aspect pixels inside the roof. Using 5.5° as fallback.")
+        return 5.5
+
+    # Circular mean using sin/cos components
+    mean_rad = math.atan2(sum_sin / count, sum_cos / count)
+    mean_deg = math.degrees(mean_rad)
+    if mean_deg < 0:
+        mean_deg += 360
+    return mean_deg
+
+  ########################
+# STEP 6: GENERATE ALL PANELS ON A ROTATED GRID
+# Inputs : Building_Structure polygon layer, Efficiency_Density raster,
+#          mean roof orientation
+# Outputs: list of dicts — each entry has 'geometry', 'center_point',
+#          'density_value'. Only panels fully inside the roof are kept.
+  ########################
+def generate_all_panels(roof_layer, suitability_raster, mean_orientation,
+                        panel_width, panel_height):
+    # Build a grid rotated by the roof orientation and keep panels that fit inside
+    orientation_rad = math.radians(mean_orientation)
+    cos_t = math.cos(orientation_rad)
+    sin_t = math.sin(orientation_rad)
+
+    step_u = panel_width
+    step_v = panel_height
+
+    roof_geoms = [feat.geometry() for feat in roof_layer.getFeatures()]
+    if not roof_geoms:
+        return []
+
+    union_geom = roof_geoms[0]
+    for g in roof_geoms[1:]:
+        union_geom = union_geom.combine(g)
+
+    vertices = extract_vertices_from_geom(union_geom)
+
+    if not vertices:
+        extent = union_geom.boundingBox()
+        minx, miny, maxx, maxy = (extent.xMinimum(), extent.yMinimum(),
+                                  extent.xMaximum(), extent.yMaximum())
+        vertices = [(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)]
+
+    minx = min([p[0] for p in vertices])
+    miny = min([p[1] for p in vertices])
+    ox, oy = minx, miny
+
+    def local_to_world(u, v):
+        # Map local (u, v) grid coordinates back to world XY
+        x = ox + u * cos_t - v * sin_t
+        y = oy + u * sin_t + v * cos_t
+        return QgsPointXY(x, y)
+
+    # Project roof vertices into the rotated (u, v) frame
+    u_vals, v_vals = [], []
+    for (x, y) in vertices:
+        dx = x - ox
+        dy = y - oy
+        u = dx * cos_t + dy * sin_t
+        v = -dx * sin_t + dy * cos_t
+        u_vals.append(u)
+        v_vals.append(v)
+
+    u_min, u_max = min(u_vals), max(u_vals)
+    v_min, v_max = min(v_vals), max(v_vals)
+
+    u_start = u_min - step_u / 2
+    u_end   = u_max + step_u / 2
+    v_start = v_min - step_v / 2
+    v_end   = v_max + step_v / 2
+
+    nu = int((u_end - u_start) / step_u) + 1
+    nv = int((v_end - v_start) / step_v) + 1
+
+    # Sweep the rotated grid and accept only panels fully inside the roof
+    all_panels = []
+    for i in range(nu):
+        u = u_start + i * step_u
+        for j in range(nv):
+            v = v_start + j * step_v
+            point = local_to_world(u, v)
+            geom = create_panel_polygon(point, orientation_rad, panel_width, panel_height)
+            if geom.within(union_geom):
+                value = get_raster_value_at_point(suitability_raster, point)
+                if value is not None and not math.isnan(value):
+                    all_panels.append({
+                        'geometry': geom,
+                        'center_point': point,
+                        'density_value': value
+                    })
+    return all_panels
+
+  ########################
+# STEP 7: SELECT THE MAXIMUM NON-OVERLAPPING SUBSET
+# Inputs : list of panel dicts (from Step 6)
+# Outputs: list of panel dicts — greedy selection by density value,
+#          no panel overlaps another
+  ########################
+def select_maximum_no_overlap(panel_list):
+    # Sort candidates by density (descending) and greedily pick non-overlapping ones
+    candidates = sorted(panel_list, key=lambda p: p['density_value'], reverse=True)
+    selected = []
+    for cand in candidates:
+        if panel_does_not_overlap(cand['geometry'], selected):
+            selected.append(cand)
+    return selected
+
+  ########################
+# STEP 8: CREATE PANEL VECTOR LAYERS
+# Inputs : layer name, list of panel dicts, CRS, optional color
+# Outputs: an in-memory polygon layer with id / density_val / area_m2
+  ########################
+def create_panel_layer(name, panel_list, roof_crs, color=None):
+    # Create a polygon layer for a given list of panels, with optional styling
+    layer = QgsVectorLayer(f"Polygon?crs={roof_crs.authid()}", name, "memory")
+    provider = layer.dataProvider()
+    provider.addAttributes([
+        QgsField("id", QVariant.Int),
+        QgsField("density_val", QVariant.Double),
+        QgsField("area_m2", QVariant.Double)
+    ])
+    layer.updateFields()
+    features = []
+    for i, p in enumerate(panel_list):
+        feat = QgsFeature()
+        feat.setGeometry(p['geometry'])
+        area = p['geometry'].area()
+        feat.setAttributes([i+1, p['density_value'], round(area, 2)])
+        features.append(feat)
+    provider.addFeatures(features)
+    layer.updateExtents()
+    if color:
+        symbol = QgsFillSymbol.createSimple({'color': color, 'outline_color': 'black'})
+        layer.renderer().setSymbol(symbol)
+        layer.triggerRepaint()
+    QgsProject.instance().addMapLayer(layer)
+    return layer
+
+  ########################
+# STEP 9: EXTRACT MEAN EFFICIENCY PER PANEL
+# Inputs : panel polygon layer, Efficiency_Density raster
+# Outputs: an in-memory polygon layer named Panels_with_Efficiency<suffix>
+#          with an extra "Efficiency_Mean" attribute per panel
+  ########################
+def extract_efficiency_for_panels(panels_layer, suitability_raster, roof_crs, suffix=""):
+    # Sample the Efficiency_Density raster at each panel's interior point
+    original_fields = panels_layer.fields()
+    layer_name = f"Panels_with_Efficiency{suffix}"
+    panels_with_efficiency = QgsVectorLayer(
+        f"Polygon?crs={roof_crs.authid()}",
+        layer_name,
+        "memory"
+    )
+    prov_eff = panels_with_efficiency.dataProvider()
+    prov_eff.addAttributes(original_fields)
+    prov_eff.addAttributes([QgsField("Efficiency_Mean", QVariant.Double)])
+    panels_with_efficiency.updateFields()
+
+    new_features = []
+    for feat in panels_layer.getFeatures():
+        geom = feat.geometry()
+        if geom.isNull() or geom.isEmpty():
+            continue
+        point_inside = geom.pointOnSurface().asPoint()
+        value = get_raster_value_at_point(suitability_raster, point_inside)
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            value = None
+        attrs = feat.attributes()
+        attrs.append(value)
+        new_feat = QgsFeature()
+        new_feat.setGeometry(geom)
+        new_feat.setAttributes(attrs)
+        new_features.append(new_feat)
+
+    prov_eff.addFeatures(new_features)
+    panels_with_efficiency.updateExtents()
+    QgsProject.instance().addMapLayer(panels_with_efficiency)
+    print(f"Layer '{layer_name}' created with {len(new_features)} features.")
+    return panels_with_efficiency
+
+  ########################
+# STEP 10: CLASSIFY PANELS BY PERCENTAGE OF THE MAXIMUM
+# Inputs : Panels_with_Efficiency layer, Efficiency_Density raster
+# Outputs: three in-memory polygon layers
+#          - Panels_10_50<suffix>     (10%-50% of the max)
+#          - Panels_50_80<suffix>     (50%-80% of the max)
+#          - Panels_Above_80<suffix>  (>80% of the max)
+  ########################
+def classify_panels(panels_with_efficiency, suitability_raster, suffix=""):
+    # Split panels into three performance buckets based on the raster maximum
+    provider_raster = suitability_raster.dataProvider()
+    band_stats = provider_raster.bandStatistics(1, QgsRasterBandStats.All)
+    max_val = band_stats.maximumValue
+    print(f"Maximum Efficiency_Density value: {max_val:.4f}")
+
+    limit_10 = max_val * 0.1
+    limit_50 = max_val * 0.5
+    limit_80 = max_val * 0.8
+
+    categories = {'10_50': [], '50_80': [], 'above_80': []}
+    for feat in panels_with_efficiency.getFeatures():
+        value = feat['Efficiency_Mean']
+        if value is None:
+            continue
+        if value < limit_10:
+            continue
+        elif value < limit_50:
+            categories['10_50'].append(feat)
+        elif value < limit_80:
+            categories['50_80'].append(feat)
+        else:
+            categories['above_80'].append(feat)
+
+    print("\nPanel classification (>=10% of maximum):")
+    print(f"  10% to 50%: {len(categories['10_50'])} panels")
+    print(f"  50% to 80%: {len(categories['50_80'])} panels")
+    print(f"  above 80%: {len(categories['above_80'])} panels")
+
+    color_map = {
+        '10_50':   ('Panels_10_50',   categories['10_50'],   '255,165,0,150'),
+        '50_80':   ('Panels_50_80',   categories['50_80'],   '255,255,0,150'),
+        'above_80':('Panels_Above_80',categories['above_80'],'0,0,255,150'),
+    }
+
+    def create_category_layer(name, feature_list, original_fields, crs, color):
+        # Create an in-memory polygon layer for a given list of classified panels
+        layer = QgsVectorLayer(f"Polygon?crs={crs.authid()}", name, "memory")
+        prov = layer.dataProvider()
+        prov.addAttributes(original_fields)
+        layer.updateFields()
+        if feature_list:
+            prov.addFeatures(feature_list)
+        layer.updateExtents()
+        if color:
+            symbol = QgsFillSymbol.createSimple({'color': color, 'outline_color': 'black'})
+            layer.renderer().setSymbol(symbol)
+            layer.triggerRepaint()
+        QgsProject.instance().addMapLayer(layer)
+        if not feature_list:
+            print(f"Warning: layer '{name}' created empty.")
+        return layer
+
+    original_fields = panels_with_efficiency.fields()
+    crs = panels_with_efficiency.crs()
+    layers = {}
+    for key, (name, feat_list, color) in color_map.items():
+        layer_name = f"{name}{suffix}"
+        layers[name] = create_category_layer(layer_name, feat_list, original_fields, crs, color)
+    return layers
+
+  ########################
+# STEP 11: POWER AND PAYBACK CALCULATION
+# Inputs : Panels_with_Efficiency layer, group layers dict,
+#          panel_area, efficiency, panel_cost, tariff
+# Outputs: printed report (W per group and simple payback in years)
+  ########################
+def calculate_power_and_payback(panels_with_efficiency, group_layers, panel_area,
+                                efficiency, panel_cost, tariff):
+    # Report total power and simple payback per performance group
+    print("\n" + "="*60)
+    print("POWER CALCULATION BY GROUP (WATT)")
+    print(f"Panel area: {panel_area} m2")
+    print(f"Efficiency: {efficiency*100:.0f}%")
+    print("Power (W) = Irradiance (W/m2) * Area (m2) * Efficiency")
+    print("="*60)
+
+    groups = [
+        ('Panels_10_50',    '10% to 50%'),
+        ('Panels_50_80',    '50% to 80%'),
+        ('Panels_Above_80', 'above 80%'),
+    ]
+
+    for group_name, description in groups:
+        group_layer = group_layers.get(group_name)
+        if not group_layer:
+            print(f"Group {description}: layer not found.")
+            continue
+
+        total_power = 0.0
+        count = 0
+        for feat in group_layer.getFeatures():
+            irrad = feat['Efficiency_Mean']
+            if irrad is None or irrad <= 0:
+                continue
+            power = irrad * panel_area * efficiency
+            total_power += power
+            count += 1
+
+        print(f"\n{description}:")
+        print(f"  Panels: {count}")
+        print(f"  Total power: {total_power:.2f} W")
+        if count > 0:
+            print(f"  Average power per panel: {total_power/count:.2f} W")
+
+    print("\n" + "="*70)
+    print("ECONOMIC ANALYSIS (SIMPLE PAYBACK)")
+    print(f"Cost per installed panel: R$ {panel_cost:.2f}")
+    print(f"Electricity tariff: R$ {tariff:.3f}/kWh")
+    print("Payback (years) = (N panels * Cost) / (Annual energy * Tariff)")
+    print("Annual energy (kWh) = Mean irradiance * Area * Efficiency * 365 / 1000")
+    print("="*70)
+
+    for group_name, description in groups:
+        group_layer = group_layers.get(group_name)
+        if not group_layer:
+            continue
+        total_daily_energy_wh = 0.0
+        count = 0
+        for feat in group_layer.getFeatures():
+            irrad = feat['Efficiency_Mean']
+            if irrad is None or irrad <= 0:
+                continue
+            daily_energy_wh = irrad * panel_area * efficiency
+            total_daily_energy_wh += daily_energy_wh
+            count += 1
+        if count == 0:
+            print(f"\n{description}: no valid panels.")
+            continue
+        annual_energy_kwh = total_daily_energy_wh * 365 / 1000
+        total_cost = count * panel_cost
+        annual_savings = annual_energy_kwh * tariff
+        payback = total_cost / annual_savings if annual_savings > 0 else float('inf')
+        print(f"\n{description}:")
+        print(f"  Panels: {count}")
+        print(f"  Annual energy: {annual_energy_kwh:.2f} kWh")
+        print(f"  Total cost: R$ {total_cost:.2f}")
+        print(f"  Annual savings: R$ {annual_savings:.2f}")
+        print(f"  Payback: {payback:.1f} years")
+
+  ########################
+# MAIN FUNCTION: process_address
+# Inputs : street_type, street_name, property_number, suffix
+# Outputs: runs Steps 1-11 for a single address; returns nothing
+#          (all layers are added to the QGIS project)
+  ########################
+def process_address(street_type, street_name, property_number, suffix=""):
+    # Orchestrate the full workflow for a single address, step by step
+    if suffix:
+        suffix = "_" + sanitize_suffix(str(suffix))
+    else:
+        suffix = ""
+
+    print(f"\n--- Processing address: {street_type} {street_name}, "
+          f"{property_number} (suffix {suffix}) ---\n")
+
+    address_layer    = get_layer_by_name(LAYER_ADDRESSES)
+    buildings_layer  = get_layer_by_name(LAYER_BUILDINGS)
+    points_layer     = get_layer_by_name(LAYER_MDS)
+
+    roof_layer = find_property_and_buildings(
+        street_type, street_name, property_number,
+        address_layer, buildings_layer, suffix
+    )
+    mds_points = extract_mds_points(points_layer, roof_layer, suffix)
+
+    rasters = interpolate_and_combine(
+        mds_points, roof_layer,
+        Z_FIELD, IDW_POWER, PIXEL_SIZE, MARGIN, suffix
+    )
+    dem      = rasters['dem']
+    slope    = rasters['slope']
+    aspect   = rasters['aspect']
+    weighted = rasters['weighted']
+
+    mean_rad, density = calculate_solar_radiation(
+        dem, aspect, slope, weighted,
+        REPRESENTATIVE_DAYS, STEP, LINKE, ALBEDO, suffix
+    )
+
+    mean_orientation = calculate_mean_orientation(aspect, roof_layer)
+    print(f"Mean roof orientation: {mean_orientation:.2f} degrees")
+
+    all_panels = generate_all_panels(
+        roof_layer, density, mean_orientation,
+        PANEL_WIDTH, PANEL_HEIGHT
+    )
+    print(f"Total panels that fit 100% inside: {len(all_panels)}")
+    if not all_panels:
+        raise Exception("No panel fits completely inside the roof. Check panel dimensions.")
+
+    best_panels = select_maximum_no_overlap(all_panels)
+    print(f"Panels selected without overlap: {len(best_panels)}")
+
+    roof_crs = roof_layer.crs()
+    layer_all = create_panel_layer(f"All_Panels{suffix}", all_panels, roof_crs,
+                                   color='200,200,200,100')
+    layer_max = create_panel_layer(f"Max_Panels_NoOverlap{suffix}", best_panels, roof_crs,
+                                   color='0,255,0,150')
+    print(f"Layers 'All_Panels{suffix}' and 'Max_Panels_NoOverlap{suffix}' added.")
+
+    panels_eff = extract_efficiency_for_panels(layer_max, density, roof_crs, suffix)
+    group_layers = classify_panels(panels_eff, density, suffix)
+
+    calculate_power_and_payback(
+        panels_eff, group_layers,
+        PANEL_AREA, EFFICIENCY, PANEL_COST, TARIFF
+    )
+
+    # Cleanup: keep only the layers of interest
+    keep_patterns = [
+        f"Efficiency_Density{suffix}",
+        f"All_Panels{suffix}",
+        f"Max_Panels_NoOverlap{suffix}",
+        f"Panels_10_50{suffix}",
+        f"Panels_50_80{suffix}",
+        f"Panels_Above_80{suffix}",
+    ]
+    project = QgsProject.instance()
+    for layer in list(project.mapLayers().values()):
+        name = layer.name()
+        if suffix in name and name not in keep_patterns:
+            project.removeMapLayer(layer.id())
+            print(f"Removed layer: {name}")
+
+    print("\n--- Processing completed successfully ---\n")
+
+  ########################
+# ADDRESS LIST (TUPLE) -- placeholders; replace with your own data
+# Format: (STREET_TYPE, STREET_NAME, PROPERTY_NUMBER)
+# Duplicates are allowed here; they will be removed automatically.
+  ########################
+raw_addresses = [
+    ("STREET", "INSERT_YOUR_STREET_HERE",   123),
+    ("STREET", "INSERT_YOUR_STREET_HERE",   456),
+    ("AVENUE", "INSERT_YOUR_AVENUE_HERE",   789),
+    # ("STREET", "ANOTHER_STREET_NAME",     1000),
+]
+
+  ########################
+# ADDRESS DEDUPLICATION
+# Inputs : raw_addresses list
+# Outputs: unique address list + number of duplicates removed
+  ########################
+addresses, n_removed = deduplicate_addresses(raw_addresses)
+
+print("="*70)
+print("ADDRESS DEDUPLICATION")
+print("="*70)
+print(f"Addresses in the original list: {len(raw_addresses)}")
+print(f"Duplicates removed:             {n_removed}")
+print(f"Unique addresses to process:    {len(addresses)}")
+print("="*70)
+
+  ########################
+# EXECUTION
+  ########################
+successes = 0
+failures = []
+processed_keys = set()
+
+for idx, (street_type, street_name, number) in enumerate(addresses, 1):
+    key = address_key(street_type, street_name, number)
+
+    if key in processed_keys:
+        print(f"[SKIP-DUP] Address {idx} ({street_type} {street_name} "
+              f"{safe_num_str(number)}) was already processed. Skipping.\n")
+        continue
+    processed_keys.add(key)
+
+    suffix = f"{safe_num_str(number)}_{idx}"
+    try:
+        process_address(street_type, street_name, number, suffix=suffix)
+        print(f"Address {idx} processed successfully.\n")
+        successes += 1
+    except Exception as e:
+        num_disp = "n/a" if is_null_number(number) else str(to_python_scalar(number))
+        print(f"[SKIP] Address {idx} ({street_type} {street_name} {num_disp}): {e}\n")
+        failures.append((idx, street_type, street_name, num_disp, str(e)))
+
+  ########################
+# FINAL SUMMARY
+  ########################
+print("\n" + "="*70)
+print("FINAL SUMMARY")
+print("="*70)
+print(f"Unique addresses in input: {len(addresses)}")
+print(f"Duplicates removed:        {n_removed}")
+print(f"Successes:                 {successes}")
+print(f"Failures:                  {len(failures)}")
+
+if failures:
+    print("\nAddresses that were not processed:")
+    for (i, t, n, num_disp, err) in failures:
+        print(f"  [{i:>2}] {t} {n}, {num_disp} -> {err}")
