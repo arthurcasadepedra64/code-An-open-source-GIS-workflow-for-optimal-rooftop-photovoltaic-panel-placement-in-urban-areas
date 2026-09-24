@@ -5,6 +5,8 @@ This is the code for the workflow described in our paper on optimal rooftop phot
 Paper is under review. Full citation will be added once it's out.
 
 The script runs in QGIS through the Python Console. You give it an address (street type, street name, number), and it does everything else
+
+
 ##################################################
 
 What it does:
@@ -19,6 +21,8 @@ What it does:
 - runs a greedy selection by density, no overlaps
 - Classifies panels into three efficiency buckets
 - Prints power and payback per bucket
+
+
 ##################################################
 
 There's also a cleanup step that removes intermediate layers at the end so the project doesn't get cluttered.
@@ -26,6 +30,9 @@ There's also a cleanup step that removes intermediate layers at the end so the p
 ######### Requirements #########
 
 QGIS 3.34.12 or newer. GRASS and GDAL come bundled with QGIS, so you shouldn't need to install anything else. The script runs inside the QGIS Python Console.
+
+
+
 
 ######### Input layers #########
 
@@ -40,6 +47,9 @@ The address layer needs three attributes: "TIPO_LOGRADOURO", "NOME_LOGRADOURO", 
 Everything must be in a metric CRS. We used SIRGAS 2000 / UTM 23S.
 
 For Belo Horizonte the data is on BH Map (https://bhmap.pbh.gov.br).
+
+
+
 
 ######### Running it #########
 
