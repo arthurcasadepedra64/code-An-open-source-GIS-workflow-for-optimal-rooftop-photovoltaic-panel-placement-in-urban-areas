@@ -5,7 +5,8 @@ This is the code for the workflow described in our paper on optimal rooftop phot
 Paper is under review. Full citation will be added once it's out.
 
 The script runs in QGIS through the Python Console. You give it an address (street type, street name, number), and it does everything else
-#####################################################################################################
+##################################################
+
 What it does:
 
 - Finds the property and the building footprint
@@ -18,7 +19,7 @@ What it does:
 - runs a greedy selection by density, no overlaps
 - Classifies panels into three efficiency buckets
 - Prints power and payback per bucket
-#####################################################################################################
+##################################################
 There's also a cleanup step that removes intermediate layers at the end so the project doesn't get cluttered.
 
 ######### Requirements #########
